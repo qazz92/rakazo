@@ -905,6 +905,33 @@ export function createRouter(deps: RouterDeps) {
           webhookConfigured: true as const,
         };
       }),
+      hermesToken: {
+        issue: authed.bots.hermesToken.issue.handler(async ({ context, input }) => {
+          const bot = await deps.prisma.bot.findFirst({
+            where: { id: input.botId, spaceId: context.actor.spaceId, archivedAt: null },
+            select: { id: true },
+          });
+          if (!bot) throw new IsolationError();
+          const token = randomBytes(32).toString("base64url");
+          const tokenHash = createHash("sha256").update(token).digest("hex");
+          // botId is unique: rotation overwrites the hash in place, which atomically
+          // invalidates the previous token. Plaintext is shown once, never stored.
+          await deps.prisma.hermesBotToken.upsert({
+            where: { botId: bot.id },
+            update: { tokenHash, revokedAt: null },
+            create: { botId: bot.id, spaceId: context.actor.spaceId, tokenHash },
+          });
+          return { token };
+        }),
+        revoke: authed.bots.hermesToken.revoke.handler(async ({ context, input }) => {
+          const updated = await deps.prisma.hermesBotToken.updateMany({
+            where: { botId: input.botId, spaceId: context.actor.spaceId, revokedAt: null },
+            data: { revokedAt: new Date() },
+          });
+          if (updated.count === 0) throw new IsolationError();
+          return { ok: true as const };
+        }),
+      },
     },
     groups: {
       create: authed.groups.create.handler(async ({ context, input }) =>

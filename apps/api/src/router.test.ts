@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { RPCHandler } from "@orpc/server/fetch";
 import { COMPUTER_SCREEN_UNAVAILABLE, ComputerScreenUnavailableError } from "@rakazo/adapters";
 import type { Actor } from "@rakazo/contracts";
@@ -606,5 +607,122 @@ describe("computer screen url", () => {
       }),
     });
     expect(updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("bots.hermesToken", () => {
+  function hermesTokenDeps(bot: unknown) {
+    const rows: Array<Record<string, unknown>> = [];
+    const prisma = {
+      bot: { findFirst: async () => bot },
+      hermesBotToken: {
+        upsert: async ({
+          where,
+          update,
+          create,
+        }: {
+          where: { botId: string };
+          update: Record<string, unknown>;
+          create: Record<string, unknown>;
+        }) => {
+          const existing = rows.find((row) => row.botId === where.botId);
+          if (existing) return Object.assign(existing, update);
+          const row = { ...create };
+          rows.push(row);
+          return row;
+        },
+        updateMany: async ({ data }: { data: Record<string, unknown> }) => {
+          let count = 0;
+          for (const row of rows) {
+            if (row.revokedAt == null) {
+              Object.assign(row, data);
+              count += 1;
+            }
+          }
+          return { count };
+        },
+      },
+    } as unknown as PrismaClient;
+    const deps = {
+      prisma,
+      env: {
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+      dataDir: "/tmp/rakazo-router-test",
+    } as unknown as RouterDeps;
+    const actor = {
+      spaceId: "workspace-1",
+      userId: "user-1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    return { rows, actor, handler: new RPCHandler(createRouter(deps)) };
+  }
+
+  async function call(handler: RPCHandler<never>, actor: Actor, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return { status: response.status, json: await response.json() };
+  }
+
+  it("issues a token, stores only its hash, and rotates on re-issue", async () => {
+    const { rows, actor, handler } = hermesTokenDeps({
+      id: "bot_1",
+      spaceId: "workspace-1",
+      threadId: "thread_1",
+    });
+
+    const first = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+    expect(first.status).toBe(200);
+    expect(first.json.json.token).toMatch(/^[A-Za-z0-9_-]{43}$/); // 32 bytes, base64url
+
+    const second = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+    expect(second.json.json.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(second.json.json.token).not.toBe(first.json.json.token);
+
+    // botId is unique in the schema: rotation replaces the hash on the single row.
+    expect(rows).toHaveLength(1);
+    expect(rows[0].tokenHash).toBe(
+      createHash("sha256").update(second.json.json.token).digest("hex"),
+    );
+    expect(rows[0].revokedAt).toBeNull();
+    expect(JSON.stringify(rows)).not.toContain(first.json.json.token);
+    expect(JSON.stringify(rows)).not.toContain(second.json.json.token);
+  });
+
+  it("rejects issue for a bot outside the actor space", async () => {
+    const { rows, actor, handler } = hermesTokenDeps(null);
+
+    const response = await call(handler, actor, "bots/hermesToken/issue", { botId: "other" });
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("revokes the active token and refuses when none is active", async () => {
+    const { rows, actor, handler } = hermesTokenDeps({
+      id: "bot_1",
+      spaceId: "workspace-1",
+      threadId: "thread_1",
+    });
+    await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+
+    const revoked = await call(handler, actor, "bots/hermesToken/revoke", { botId: "bot_1" });
+    expect(revoked.status).toBe(200);
+    expect(revoked.json.json).toEqual({ ok: true });
+    expect(rows[0].revokedAt).toBeInstanceOf(Date);
+
+    const repeat = await call(handler, actor, "bots/hermesToken/revoke", { botId: "bot_1" });
+    expect(repeat.status).toBeGreaterThanOrEqual(400);
   });
 });

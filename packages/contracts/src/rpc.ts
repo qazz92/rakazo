@@ -217,6 +217,10 @@ export const appContract = {
         webhookConfigured: z.literal(true),
       }),
     ),
+    hermesToken: {
+      issue: oc.input(botId).output(z.object({ token: z.string() })),
+      revoke: oc.input(botId).output(z.object({ ok: z.literal(true) })),
+    },
   },
   groups: {
     create: oc.input(CreateGroupInput).output(GroupSchema),
