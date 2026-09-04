@@ -8,6 +8,7 @@ import {
   stopThreadRuns,
   type ThreadTarget,
   threadHead,
+  sendThreadMessage,
   threadSnapshot,
 } from "./thread-target.js";
 
@@ -693,6 +694,154 @@ describe("threadSnapshot", () => {
     expect(snapshot.activeRuns).toEqual([
       expect.objectContaining({ id: "run-late", status: "running" }),
     ]);
+  });
+});
+
+describe("sendThreadMessage hermes routing", () => {
+  function fakeSendDeps(options: { hermesToken: Record<string, unknown> | null }) {
+    const turns: Array<Record<string, unknown>> = [];
+    const tasks: Array<Record<string, unknown>> = [];
+    const runs: Array<Record<string, unknown>> = [];
+    const messages: Array<Record<string, unknown>> = [];
+    const events: Array<Record<string, unknown>> = [];
+    const enqueued: unknown[] = [];
+    let messageSeq = 0;
+    let eventSeq = 0;
+    let counter = 0;
+    const nextId = (prefix: string) => `${prefix}_${(counter += 1)}`;
+
+    const prisma = {
+      $transaction: (callback: (client: unknown) => unknown) => callback(prisma),
+      thread: {
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          if ("nextMessageSeq" in data) messageSeq += 1;
+          if ("nextEventSeq" in data) eventSeq += 1;
+          return { nextMessageSeq: messageSeq + 1, nextEventSeq: eventSeq + 1 };
+        },
+      },
+      message: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("message"), ...data };
+          messages.push(row);
+          return row;
+        },
+        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+          const row = messages.find((message) => message.id === where.id);
+          if (row) Object.assign(row, data);
+          return row ?? {};
+        },
+      },
+      task: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("task"), ...data };
+          tasks.push(row);
+          return row;
+        },
+      },
+      run: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("run"), ...data };
+          runs.push(row);
+          return row;
+        },
+        findFirst: async () => null,
+        findMany: async () => [],
+        findUnique: async ({ where }: { where: { id: string } }) =>
+          runs.find((run) => run.id === where.id) ?? null,
+        updateMany: async () => ({ count: 0 }),
+      },
+      event: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("event"), ...data };
+          events.push(row);
+          return row;
+        },
+      },
+      hermesBotToken: {
+        findFirst: async () => options.hermesToken,
+      },
+      hermesTurn: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("turn"), status: "queued", ...data };
+          turns.push(row);
+          return row;
+        },
+      },
+    };
+
+    const deps = {
+      prisma: prisma as unknown as PrismaClient,
+      events: { notify: vi.fn().mockResolvedValue(undefined) },
+      jobs: { enqueue: vi.fn(async (job: unknown) => void enqueued.push(job)) },
+    };
+    const actor = {
+      spaceId: "space_1",
+      userId: "user_1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    const target = {
+      kind: "bot",
+      botId: "bot_1",
+      threadId: "thread_1",
+      bot: {},
+    } as unknown as ThreadTarget;
+    return { deps, actor, target, turns, tasks, runs, messages, events, enqueued };
+  }
+
+  it("routes hermes bots to the turn queue with a companion run", async () => {
+    const { deps, actor, target, turns, runs, messages, events, enqueued } = fakeSendDeps({
+      hermesToken: { id: "token_1", botId: "bot_1" },
+    });
+
+    const result = await sendThreadMessage(deps, actor, target, { text: "안녕" });
+
+    // threads.send output contract stays intact for the UI.
+    expect(result).toMatchObject({
+      taskId: expect.any(String),
+      runId: expect.any(String),
+      seq: expect.any(Number),
+    });
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      botId: "bot_1",
+      threadId: "thread_1",
+      runId: result.runId,
+      prompt: "안녕",
+      status: "queued",
+    });
+    // Companion Task/Run rows exist so the thread shows a queued execution…
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      botId: "bot_1",
+      taskId: result.taskId,
+      status: "queued",
+      trigger: "user",
+      sourceMessageId: messages[0].id,
+    });
+    expect(messages[0].runId).toBe(result.runId);
+    expect(events[0].payload).toMatchObject({
+      messageId: messages[0].id,
+      role: "user",
+      runIds: [result.runId],
+    });
+    // …but nothing is dispatched locally — the mini's hermes long-polls the turn.
+    expect(enqueued).toEqual([]);
+  });
+
+  it("keeps the run executor path for non-hermes bots", async () => {
+    const { deps, actor, target, turns, runs, enqueued } = fakeSendDeps({
+      hermesToken: null,
+    });
+
+    const result = await sendThreadMessage(deps, actor, target, { text: "hello" });
+
+    expect(turns).toEqual([]);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ status: "queued", trigger: "user" });
+    expect(result.runId).toBe(runs[0].id);
+    expect(enqueued).toHaveLength(1);
+    expect(enqueued[0]).toMatchObject({ name: "run.continue", payload: { runId: result.runId } });
   });
 });
 

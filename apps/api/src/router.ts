@@ -125,6 +125,7 @@ import {
   resolveBusyBotName,
   toComputerStatus,
 } from "./computer-status.js";
+import { assertNoHermesMembers, isHermesBot } from "./hermes-channel.js";
 import { buildMcpUpdateMaterial } from "./mcp-material.js";
 import { chooseFocus, markAppConnected, startOnboarding } from "./onboarding.js";
 import { listSpaceRuns } from "./runs.js";
@@ -1103,10 +1104,12 @@ export function createRouter(deps: RouterDeps) {
         }
       }),
       send: authed.threads.send.handler(async ({ context, input }) => {
-        if ((await modelSetup(deps, context.actor)).needsModel) {
+        const target = await resolveThreadTarget(deps.prisma, context.actor, input);
+        // rakazo-fork: hermes — hermes bots run on the mini's own profile, no local model needed
+        const hermes = target.kind === "bot" && (await isHermesBot(deps.prisma, target.botId));
+        if (!hermes && (await modelSetup(deps, context.actor)).needsModel) {
           throw new ORPCError("BAD_REQUEST", { message: "Connect a model to start a run." });
         }
-        const target = await resolveThreadTarget(deps.prisma, context.actor, input);
         if (target.kind === "bot") {
           await assertTeachingSendAllowed(deps.prisma, context.actor.spaceId, target.botId);
         }
@@ -1219,6 +1222,8 @@ export function createRouter(deps: RouterDeps) {
           });
           const botId = group?.members[0]?.botId;
           if (!botId) throw new IsolationError();
+          // rakazo-fork: hermes — group fan-out guard (body: hermes-channel.ts)
+          if (group) await assertNoHermesMembers(tx, group.members.map((member) => member.botId));
           const blocks = [{ kind: "text" as const, text: input.text }];
           const message = await createThreadMessageInTransaction(tx, {
             threadId: target.threadId,

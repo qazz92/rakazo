@@ -1,8 +1,10 @@
+import { ORPCError } from "@orpc/server";
 import type { Hono } from "hono";
 import { createHash } from "node:crypto";
 import {
   appendEventInTransaction,
   createThreadMessageInTransaction,
+  type Prisma,
   type PrismaClient,
   type ThreadEvents,
 } from "@rakazo/db";
@@ -68,6 +70,116 @@ export async function claimNextHermesTurn(
     where: { id: next.id },
     select: { id: true, threadId: true, prompt: true },
   });
+}
+
+export async function isHermesBot(
+  prisma: Pick<PrismaClient, "hermesBotToken">,
+  botId: string,
+): Promise<boolean> {
+  const token = await prisma.hermesBotToken.findFirst({
+    where: { botId, revokedAt: null },
+    select: { id: true },
+  });
+  return token !== null;
+}
+
+/** Fan-out guard: a hermes member in a group thread would answer as one of
+ *  many voices with no PM to coordinate — team bots stay in 1:1 threads. */
+export async function assertNoHermesMembers(
+  prisma: Pick<PrismaClient, "hermesBotToken">,
+  botIds: string[],
+): Promise<void> {
+  const hermesMembers = await Promise.all(botIds.map((id) => isHermesBot(prisma, id)));
+  if (hermesMembers.some(Boolean)) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Team bots coordinate through their PM — send requests to a single bot's thread.",
+    });
+  }
+}
+
+export interface HermesSendRedirect {
+  message: { id: string; seq: number };
+  runs: Array<{ id: string; taskId: string; status: string }>;
+  eventSeq: number;
+  hermes: true;
+}
+
+export interface HermesSendArgs {
+  spaceId: string;
+  botId: string;
+  threadId: string;
+  userId: string;
+  message: { id: string; seq: number };
+  blocks: unknown[];
+  prompt: string;
+  replyToMessageId?: string;
+}
+
+/**
+ * Fork: route a bot-thread send to the hermes turn queue instead of the local
+ * run executor. Returns null for non-hermes bots so the normal path continues.
+ * A companion Task/Run (both queued) keeps the threads.send output contract
+ * ({taskId, runId, seq}) and the UI's execution state; the reply endpoint
+ * completes the run when hermes answers. cancelSupersededQueuedRuns is not
+ * called: hermes turns run sequentially on the mini.
+ */
+export async function redirectHermesSend(
+  tx: Prisma.TransactionClient,
+  args: HermesSendArgs,
+): Promise<HermesSendRedirect | null> {
+  const token = await tx.hermesBotToken.findFirst({
+    where: { botId: args.botId, revokedAt: null },
+    select: { id: true },
+  });
+  if (!token) return null;
+
+  const task = await tx.task.create({
+    data: {
+      spaceId: args.spaceId,
+      botId: args.botId,
+      threadId: args.threadId,
+      userId: args.userId,
+      prompt: args.prompt,
+      status: "queued",
+    },
+  });
+  const run = await tx.run.create({
+    data: {
+      spaceId: args.spaceId,
+      botId: args.botId,
+      threadId: args.threadId,
+      taskId: task.id,
+      userId: args.userId,
+      status: "queued",
+      trigger: "user",
+      sourceMessageId: args.message.id,
+    },
+  });
+  await tx.message.update({ where: { id: args.message.id }, data: { runId: run.id } });
+  await tx.hermesTurn.create({
+    data: {
+      spaceId: args.spaceId,
+      botId: args.botId,
+      threadId: args.threadId,
+      runId: run.id,
+      prompt: args.prompt,
+    },
+  });
+  const event = await appendEventInTransaction(tx, {
+    spaceId: args.spaceId,
+    threadId: args.threadId,
+    botId: args.botId,
+    type: "thread.message.created",
+    runId: run.id,
+    payload: {
+      messageId: args.message.id,
+      role: "user",
+      blocks: args.blocks,
+      runIds: [run.id],
+      replyToMessageId: args.replyToMessageId,
+    },
+  });
+  return { message: args.message, runs: [run], eventSeq: event.seq, hermes: true };
 }
 
 /**

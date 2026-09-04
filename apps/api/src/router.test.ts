@@ -112,6 +112,14 @@ describe("model setup gate", () => {
           avatarStyle: "robot",
         }),
       },
+      bot: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "bot-1",
+          thread: { id: "thread-1" },
+          computer: null,
+        }),
+      },
+      hermesBotToken: { findFirst: vi.fn().mockResolvedValue(null) },
       spaceModelPreference: { findFirst: vi.fn().mockResolvedValue(null) },
       deploymentSettings: {
         findUnique: vi
@@ -724,5 +732,131 @@ describe("bots.hermesToken", () => {
 
     const repeat = await call(handler, actor, "bots/hermesToken/revoke", { botId: "bot_1" });
     expect(repeat.status).toBeGreaterThanOrEqual(400);
+  });
+});
+
+describe("threads.send group hermes guard", () => {
+  function groupSendDeps(hermesBotId: string | null) {
+    const turns: Array<Record<string, unknown>> = [];
+    const enqueued: unknown[] = [];
+    let counter = 0;
+    const nextId = (prefix: string) => `${prefix}_${(counter += 1)}`;
+    const members = [
+      { botId: hermesBotId ?? "bot_local_a", bot: { id: hermesBotId ?? "bot_local_a", name: "A", color: "#111111", runs: [] } },
+      { botId: "bot_local_b", bot: { id: "bot_local_b", name: "B", color: "#222222", runs: [] } },
+    ];
+    const prisma = {
+      $transaction: (callback: (client: unknown) => unknown) => callback(prisma),
+      $queryRaw: async () => [{ id: "group_1" }],
+      chatGroup: {
+        findFirst: async () => ({
+          id: "group_1",
+          name: "Team",
+          thread: { id: "thread_1" },
+          members,
+        }),
+        update: async () => ({}),
+      },
+      spaceModelPreference: { findFirst: async () => null },
+      deploymentSettings: { findUnique: async () => null },
+      hermesBotToken: {
+        findFirst: async ({ where }: { where: { botId: string } }) =>
+          where.botId === hermesBotId ? { id: "token_1", botId: where.botId } : null,
+      },
+      hermesTurn: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          turns.push(data);
+          return data;
+        },
+      },
+      thread: {
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          if ("nextMessageSeq" in data) return { nextMessageSeq: 1 };
+          return { nextEventSeq: 1 };
+        },
+      },
+      message: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: nextId("message"), ...data }),
+        update: async ({ where }: { where: { id: string } }) => ({ id: where.id }),
+      },
+      task: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: nextId("task"), ...data }),
+      },
+      run: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: nextId("run"), ...data }),
+        findFirst: async () => null,
+        findMany: async () => [],
+        findUnique: async () => ({ id: "run_x", status: "queued", startedAt: null }),
+        updateMany: async () => ({ count: 0 }),
+      },
+      event: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: nextId("event"), ...data }),
+      },
+    } as unknown as PrismaClient;
+    const deps = {
+      prisma,
+      events: { notify: async () => undefined },
+      jobs: { enqueue: async (job: unknown) => void enqueued.push(job) },
+      env: {
+        agentRuntime: "scripted",
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+      dataDir: "/tmp/rakazo-router-test",
+    } as unknown as RouterDeps;
+    const actor = {
+      spaceId: "workspace-1",
+      userId: "user-1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    return { turns, enqueued, actor, handler: new RPCHandler(createRouter(deps)) };
+  }
+
+  async function call(handler: RPCHandler<never>, actor: Actor, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return { status: response.status, json: await response.json() };
+  }
+
+  it("rejects a group send when any member is a hermes bot", async () => {
+    const { turns, actor, handler } = groupSendDeps("bot_hermes");
+
+    const response = await call(handler, actor, "threads/send", {
+      groupId: "group_1",
+      text: "hello team",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      json: expect.objectContaining({
+        code: "BAD_REQUEST",
+        message: "Team bots coordinate through their PM — send requests to a single bot's thread.",
+      }),
+    });
+    expect(turns).toHaveLength(0);
+  });
+
+  it("keeps local-only groups on the fan-out path", async () => {
+    const { turns, enqueued, actor, handler } = groupSendDeps(null);
+
+    const response = await call(handler, actor, "threads/send", {
+      groupId: "group_1",
+      text: "@everyone status check",
+    });
+
+    expect(response.status).toBe(200);
+    expect(turns).toHaveLength(0);
+    // Both local members fan out: one run.continue job per member bot.
+    expect(enqueued).toHaveLength(2);
   });
 });

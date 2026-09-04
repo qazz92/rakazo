@@ -34,6 +34,7 @@ import {
   resolveSendAttachments,
 } from "./artifacts.js";
 import { resolveBusyBotName, toComputerStatus } from "./computer-status.js";
+import { assertNoHermesMembers, redirectHermesSend } from "./hermes-channel.js";
 import { withSerializableRetry } from "./serializable-retry.js";
 import { loadMessagePage } from "./thread-message-pages.js";
 
@@ -573,6 +574,18 @@ export async function sendThreadMessage(
           replyToMessageId: input.replyToMessageId,
           clientNonce: input.clientNonce,
         });
+        // rakazo-fork: hermes — full body lives in hermes-channel.ts redirectHermesSend
+        const hermesRedirect = await redirectHermesSend(tx, {
+          spaceId: actor.spaceId,
+          botId: target.botId,
+          threadId: target.threadId,
+          userId: actor.userId,
+          message,
+          blocks,
+          prompt: buildSendPrompt(input.text, artifacts, connectorNames),
+          replyToMessageId: input.replyToMessageId,
+        });
+        if (hermesRedirect) return hermesRedirect;
         const active = await tx.run.findFirst({
           where: {
             threadId: target.threadId,
@@ -654,6 +667,8 @@ export async function sendThreadMessage(
 
       const members = await lockAndLoadGroupMembers(tx, actor, target);
       const memberBotIds = members.map((member) => member.botId);
+      // rakazo-fork: hermes — group fan-out guard (body: hermes-channel.ts)
+      await assertNoHermesMembers(tx, memberBotIds);
       const mentionTargets = splitMentionTargets(input.mentions);
       const targetBotIds = resolveGroupTargetBotIds({
         text: input.text ?? "",
@@ -766,7 +781,9 @@ export async function sendThreadMessage(
     // Subscribers catch up from the durable event cursor after a missed realtime wake.
     console.error("thread send realtime notification", error);
   });
-  await enqueueRunsNeedingContinue(deps.jobs, committed.runs);
+  if (!("hermes" in committed && committed.hermes)) {
+    await enqueueRunsNeedingContinue(deps.jobs, committed.runs);
+  }
   return sendResult(committed.message, committed.runs);
 }
 
