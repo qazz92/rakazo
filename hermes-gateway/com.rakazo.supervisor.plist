@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Rakazo supervisor launchd job (Mac mini).
+
+  This file is committed with SYMBOLIC placeholders — replace all of them at
+  deploy time (sed or by hand), then copy to ~/Library/LaunchAgents/ and run:
+    launchctl load ~/Library/LaunchAgents/com.rakazo.supervisor.plist
+
+  Placeholders:
+    __UV_ABS_PATH__        absolute path to uv, e.g. /Users/you/.local/bin/uv
+                           (launchd does not inherit the shell PATH — verify with `which uv`)
+    __FORK_CHECKOUT_PATH__ rakazo fork checkout root, e.g. /Users/you/src/rakazo
+    __USER_HOME__          home directory, e.g. /Users/you
+    __UV_DIR__             directory containing uv + hermes binaries for PATH,
+                           e.g. /Users/you/.local/bin
+    __RAKAZO_API_HOST__    public host of the rakazo fork API (https prefix kept below)
+    __RAKAZO_DEPLOY_TOKEN__ must equal the api's HERMES_DEPLOY_TOKEN (never commit the real value)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.rakazo.supervisor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_ABS_PATH__</string>
+    <string>run</string>
+    <string>--with</string>
+    <string>httpx</string>
+    <string>--with</string>
+    <string>pyyaml</string>
+    <string>python</string>
+    <string>__FORK_CHECKOUT_PATH__/hermes-gateway/supervisor.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__UV_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RAKAZO_URL</key><string>https://__RAKAZO_API_HOST__</string>
+    <key>RAKAZO_DEPLOY_TOKEN</key><string>__RAKAZO_DEPLOY_TOKEN__</string>
+    <key>RAKAZO_TEMPLATE_PROFILE</key><string>rakazo-template</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>__USER_HOME__/Library/Logs/rakazo-supervisor.log</string>
+</dict>
+</plist>
