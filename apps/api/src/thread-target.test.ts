@@ -721,10 +721,20 @@ describe("sendThreadMessage hermes routing", () => {
       },
       message: {
         create: async ({ data }: { data: Record<string, unknown> }) => {
-          const row = { id: nextId("message"), ...data };
+          const row = { id: nextId("message"), sourceRuns: [], ...data };
           messages.push(row);
           return row;
         },
+        findUnique: async ({
+          where,
+        }: {
+          where: { threadId_clientNonce: { threadId: string; clientNonce: string } };
+        }) =>
+          messages.find(
+            (message) =>
+              message.threadId === where.threadId_clientNonce.threadId &&
+              message.clientNonce === where.threadId_clientNonce.clientNonce,
+          ) ?? null,
         update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
           const row = messages.find((message) => message.id === where.id);
           if (row) Object.assign(row, data);
@@ -745,7 +755,8 @@ describe("sendThreadMessage hermes routing", () => {
           return row;
         },
         findFirst: async () => null,
-        findMany: async () => [],
+        findMany: async ({ where }: { where?: { id?: { in: string[] } } }) =>
+          where?.id?.in ? runs.filter((run) => where.id.in.includes(run.id as string)) : [],
         findUnique: async ({ where }: { where: { id: string } }) =>
           runs.find((run) => run.id === where.id) ?? null,
         updateMany: async () => ({ count: 0 }),
@@ -755,6 +766,21 @@ describe("sendThreadMessage hermes routing", () => {
           const row = { id: nextId("event"), ...data };
           events.push(row);
           return row;
+        },
+        findFirst: async ({
+          where,
+          orderBy,
+        }: {
+          where?: { type?: string; threadId?: string };
+          orderBy?: { seq?: "desc" };
+        }) => {
+          let rows = events.filter(
+            (event) =>
+              (!where?.type || event.type === where.type) &&
+              (!where?.threadId || event.threadId === where.threadId),
+          );
+          if (orderBy?.seq === "desc") rows = [...rows].reverse();
+          return rows[0] ?? null;
         },
       },
       hermesBotToken: {
@@ -766,6 +792,10 @@ describe("sendThreadMessage hermes routing", () => {
           turns.push(row);
           return row;
         },
+        findMany: async ({ where }: { where?: { runId?: { in: string[] } } }) =>
+          where?.runId?.in
+            ? turns.filter((turn) => where.runId.in.includes(turn.runId as string))
+            : [],
       },
     };
 
@@ -843,7 +873,27 @@ describe("sendThreadMessage hermes routing", () => {
     expect(enqueued).toHaveLength(1);
     expect(enqueued[0]).toMatchObject({ name: "run.continue", payload: { runId: result.runId } });
   });
+
+  it("does not locally dispatch a replayed hermes send", async () => {
+    const { deps, actor, target, turns, enqueued } = fakeSendDeps({
+      hermesToken: { id: "token_1", botId: "bot_1" },
+    });
+
+    const first = await sendThreadMessage(deps, actor, target, {
+      text: "다시",
+      clientNonce: "nonce-1",
+    });
+    const replay = await sendThreadMessage(deps, actor, target, {
+      text: "다시",
+      clientNonce: "nonce-1",
+    });
+
+    expect(replay.runId).toBe(first.runId);
+    expect(turns).toHaveLength(1); // the receipt replays; no duplicate turn
+    expect(enqueued).toEqual([]); // a replayed hermes run must never dispatch locally
+  });
 });
+
 
 function isTerminalRunQuery(where: { status?: { in?: string[] } } | undefined) {
   const statuses = where?.status?.in;

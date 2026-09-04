@@ -859,4 +859,22 @@ describe("threads.send group hermes guard", () => {
     // Both local members fan out: one run.continue job per member bot.
     expect(enqueued).toHaveLength(2);
   });
+
+  it("rejects a group follow-up when any member is a hermes bot", async () => {
+    const { turns, actor, handler } = groupSendDeps("bot_hermes");
+
+    const response = await call(handler, actor, "threads/followUp", {
+      groupId: "group_1",
+      text: "and then?",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      json: expect.objectContaining({
+        code: "BAD_REQUEST",
+        message: "Team bots coordinate through their PM — send requests to a single bot's thread.",
+      }),
+    });
+    expect(turns).toHaveLength(0);
+  });
 });

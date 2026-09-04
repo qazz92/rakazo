@@ -97,6 +97,22 @@ export async function assertNoHermesMembers(
   }
 }
 
+/** Drop runs that belong to a hermes turn: their execution lives on the
+ *  mini, so local dispatch sites (send replay) must skip them. */
+export async function withoutHermesRuns<T extends { id: string }>(
+  prisma: Pick<PrismaClient, "hermesTurn">,
+  runs: T[],
+): Promise<T[]> {
+  if (!runs.length) return runs;
+  const turns = await prisma.hermesTurn.findMany({
+    where: { runId: { in: runs.map((run) => run.id) } },
+    select: { runId: true },
+  });
+  if (!turns.length) return runs;
+  const hermesRunIds = new Set(turns.map((turn) => turn.runId));
+  return runs.filter((run) => !hermesRunIds.has(run.id));
+}
+
 export interface HermesSendRedirect {
   message: { id: string; seq: number };
   runs: Array<{ id: string; taskId: string; status: string }>;

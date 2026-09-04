@@ -34,7 +34,11 @@ import {
   resolveSendAttachments,
 } from "./artifacts.js";
 import { resolveBusyBotName, toComputerStatus } from "./computer-status.js";
-import { assertNoHermesMembers, redirectHermesSend } from "./hermes-channel.js";
+import {
+  assertNoHermesMembers,
+  redirectHermesSend,
+  withoutHermesRuns,
+} from "./hermes-channel.js";
 import { withSerializableRetry } from "./serializable-retry.js";
 import { loadMessagePage } from "./thread-message-pages.js";
 
@@ -169,7 +173,8 @@ async function replayExistingSend(
     : message.sourceRuns.length
       ? message.sourceRuns
       : [linkedRun!];
-  await enqueueRunsNeedingContinue(deps.jobs, runs);
+  // rakazo-fork: hermes — a replayed receipt must never dispatch the mini's turn locally
+  await enqueueRunsNeedingContinue(deps.jobs, await withoutHermesRuns(deps.prisma, runs));
   const latestEvent = await deps.prisma.event.findFirst({
     where: { threadId },
     orderBy: { seq: "desc" },
@@ -576,12 +581,8 @@ export async function sendThreadMessage(
         });
         // rakazo-fork: hermes — full body lives in hermes-channel.ts redirectHermesSend
         const hermesRedirect = await redirectHermesSend(tx, {
-          spaceId: actor.spaceId,
-          botId: target.botId,
-          threadId: target.threadId,
-          userId: actor.userId,
-          message,
-          blocks,
+          spaceId: actor.spaceId, botId: target.botId, threadId: target.threadId,
+          userId: actor.userId, message, blocks,
           prompt: buildSendPrompt(input.text, artifacts, connectorNames),
           replyToMessageId: input.replyToMessageId,
         });
@@ -781,6 +782,7 @@ export async function sendThreadMessage(
     // Subscribers catch up from the durable event cursor after a missed realtime wake.
     console.error("thread send realtime notification", error);
   });
+  // rakazo-fork: hermes — the companion run executes on the mini, never as a local job
   if (!("hermes" in committed && committed.hermes)) {
     await enqueueRunsNeedingContinue(deps.jobs, committed.runs);
   }
