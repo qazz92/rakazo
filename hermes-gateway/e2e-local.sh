@@ -27,14 +27,14 @@ REPLY_TEXT=${REPLY_TEXT:-e2e 답}
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
-# oRPC mounts at /rpc with slash-joined procedure paths, and its success body
-# is the JSON tuple [data, meta, maps, blobs] — unwrap with .[0].
+# oRPC (@orpc/server 1.15) mounts at /rpc with slash-joined procedure paths;
+# the wire is {"json": <input>} in and {"json": <output>} out — unwrap .json.
 rpc() { # rpc <procedure-path> <json-body>
-  curl -sf -X POST "$API/rpc/$1" \
+  curl -sf -m 15 -X POST "$API/rpc/$1" \
     -H "authorization: Bearer $AUTH" \
     -H 'content-type: application/json' \
     ${SPACE_ID:+-H "x-rakazo-space-id: $SPACE_ID"} \
-    -d "$2"
+    -d "$(jq -nc --argjson body "$2" '{json: $body}')"
 }
 
 # Reruns get fresh nonces: Message(threadId, clientNonce) is unique, so a fixed
@@ -42,14 +42,14 @@ rpc() { # rpc <procedure-path> <json-body>
 NONCE="e2e-$(date +%s)"
 
 echo "== issue hermes token"
-TOKEN=$(rpc bots/hermesToken/issue "{\"botId\":\"$BOT_ID\"}" | jq -r '.[0].token')
+TOKEN=$(rpc bots/hermesToken/issue "{\"botId\":\"$BOT_ID\"}" | jq -r '.json.token')
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "token issue failed" >&2; exit 1; }
 echo "token issued: ${TOKEN:0:8}..."
 
 echo "== send (expect turn queued: taskId/runId/seq)"
 SEND=$(rpc threads/send "{\"botId\":\"$BOT_ID\",\"text\":\"hermes e2e\",\"clientNonce\":\"$NONCE-send\"}")
-echo "$SEND" | jq -e '.[0].taskId' >/dev/null || { echo "send failed: $SEND" >&2; exit 1; }
-echo "$SEND" | jq -c '.[0]'
+echo "$SEND" | jq -e '.json.taskId' >/dev/null || { echo "send failed: $SEND" >&2; exit 1; }
+echo "$SEND" | jq -c '.json'
 
 echo "== long-poll turns/next (server holds up to 25s per request)"
 TURN=""
@@ -88,7 +88,7 @@ DUP=$(reply | jq -r '.duplicate // false')
 echo "== thread mirror (expect '$REPLY_TEXT' as a bot message)"
 PAGE=$(rpc threads/messages "{\"botId\":\"$BOT_ID\"}")
 FOUND=$(echo "$PAGE" | jq -r --arg t "$REPLY_TEXT" \
-  '[.[0].messages[] | select(.role == "bot") | .blocks[]? | select(.kind == "text") | .text]
+  '[.json.messages[] | select(.role == "bot") | .blocks[]? | select(.kind == "text") | .text]
    | any(. == $t)')
 [ "$FOUND" = true ] && echo "thread mirror OK" \
   || { echo "reply text missing from thread messages" >&2; exit 1; }

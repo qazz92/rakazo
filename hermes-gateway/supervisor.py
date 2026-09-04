@@ -273,8 +273,23 @@ def main() -> None:
         sys.exit("RAKAZO_URL and RAKAZO_DEPLOY_TOKEN are required")
     headers = {"authorization": f"Bearer {DEPLOY_TOKEN}"}
     with httpx.Client(headers=headers, timeout=30.0) as client:
+        pending = None  # result POST not yet acknowledged: {id, ok, detail}
         while True:
             try:
+                # Re-POST a failed result before claiming the next command:
+                # until it lands the command stays delivered with the token
+                # plaintext still in its payload. Posting is idempotent for
+                # delivered rows; 404 means it was already finalized.
+                if pending:
+                    res = client.post(
+                        f"{API}/api/v1/hermes/commands/{pending['id']}/result",
+                        json={"ok": pending["ok"], "detail": pending["detail"]},
+                    )
+                    if res.status_code in (200, 404):
+                        pending = None
+                    else:
+                        time.sleep(10)
+                        continue
                 res = client.post(f"{API}/api/v1/hermes/commands/next")
                 if res.status_code != 200:
                     time.sleep(10)
@@ -288,8 +303,11 @@ def main() -> None:
                     ok, detail = False, f"unknown action {cmd['action']!r}"
                 else:
                     ok, detail = handler(cmd)
-                client.post(f"{API}/api/v1/hermes/commands/{cmd['id']}/result",
-                            json={"ok": ok, "detail": detail})
+                pending = {"id": cmd["id"], "ok": ok, "detail": detail}
+                res = client.post(f"{API}/api/v1/hermes/commands/{cmd['id']}/result",
+                                  json={"ok": ok, "detail": detail})
+                if res.status_code in (200, 404):
+                    pending = None
                 print(f"[rakazo-supervisor] {cmd['action']} {cmd['payload'].get('name')}: {detail}", file=sys.stderr)
             except Exception as exc:  # ponytail: crash-loop 방지 최소 후프
                 print(f"[rakazo-supervisor] {exc}", file=sys.stderr)
