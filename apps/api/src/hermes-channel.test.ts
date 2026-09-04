@@ -378,6 +378,14 @@ describe("hermes channel POST /turns/:turnId/reply", () => {
     });
     expect(invalid.status).toBe(400);
 
+    const nullBody = await app.request(`${HERMES_CHANNEL_BASE_PATH}/turns/ad-hoc/reply`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: "null",
+    });
+    expect(nullBody.status).toBe(400);
+    await expect(nullBody.json()).resolves.toEqual({ error: "Invalid JSON" });
+
     expect(createMessage).not.toHaveBeenCalled();
   });
 });

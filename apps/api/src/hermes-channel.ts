@@ -99,7 +99,10 @@ export function mountHermesChannelRoutes(
     if (!auth) return c.json({ error: "Unauthorized" }, 401);
     let body: { threadId?: unknown; text?: unknown; clientNonce?: unknown };
     try {
-      body = await c.req.json();
+      // A literal `null` (or scalar) parses without throwing — guard before field access.
+      const parsed: unknown = await c.req.json();
+      if (!parsed || typeof parsed !== "object") return c.json({ error: "Invalid JSON" }, 400);
+      body = parsed as typeof body;
     } catch {
       return c.json({ error: "Invalid JSON" }, 400);
     }
