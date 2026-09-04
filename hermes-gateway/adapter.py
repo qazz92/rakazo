@@ -98,7 +98,13 @@ class RakazoAdapter(BasePlatformAdapter):
                     MessageEvent(
                         text=body["prompt"],
                         message_type=MessageType.TEXT,
-                        source=self.build_source(chat_id=body["threadId"], chat_type="dm"),
+                        # user_id 필수: hermes authz는 신원 없는 인바운드를 정책과
+                        # 무관하게 기각한다(authz_mixin.py:489). rakazo는 bearer 토큰이
+                        # 이미 채널을 인증하므로 스레드 id를 안정 신원으로 쓴다.
+                        source=self.build_source(
+                            chat_id=body["threadId"], chat_type="dm",
+                            user_id=body["threadId"], user_name="Rakazo",
+                        ),
                         metadata={"turnId": body["id"]},
                     )
                 )
