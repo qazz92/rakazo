@@ -178,21 +178,28 @@ export async function isHermesBot(
 }
 
 /**
- * Fork: token propagation after hermesToken.issue. A bot with no completed
- * provision has no profile yet — the supervisor's update handler would fail
- * "profile does not exist" and the bot would queue user messages forever —
- * so the first issue must enqueue the full provision payload instead.
+ * Fork: token propagation after hermesToken.issue. A provision that is
+ * queued, delivered, or done means the profile is being or has been created —
+ * 'update' is FIFO-correct there (it runs after the in-flight provision),
+ * while a second full 'provision' would fail "profile exists" and strand the
+ * in-flight token. No provision row (or a failed one) means the profile
+ * likely does not exist: an 'update' would fail "profile does not exist" and
+ * the bot's sends would queue forever, so the full payload is re-issued.
  */
 export async function propagateHermesToken(
   prisma: Pick<PrismaClient, "hermesCommand">,
   bot: { id: string; instructions: string; threadId: string },
   token: string,
 ): Promise<void> {
-  const provisioned = await prisma.hermesCommand.findFirst({
-    where: { botId: bot.id, action: "provision", status: "done" },
+  const provisionRow = await prisma.hermesCommand.findFirst({
+    where: {
+      botId: bot.id,
+      action: "provision",
+      status: { in: ["queued", "delivered", "done"] },
+    },
     select: { id: true },
   });
-  if (provisioned) {
+  if (provisionRow) {
     await enqueueHermesCommand(prisma, bot.id, "update", {
       name: `rakazo-${bot.id}`,
       token,

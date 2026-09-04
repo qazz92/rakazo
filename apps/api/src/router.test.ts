@@ -1008,16 +1008,17 @@ describe("hermes provisioning lifecycle", () => {
       archivedAt?: Date;
       hermesTokenRow?: Record<string, unknown> | null;
       provisioned?: boolean;
+      provisionStatus?: string;
     } = {},
   ) {
     const commands: Array<Record<string, unknown>> = [];
     const tokenRows: Array<Record<string, unknown>> = [];
-    if (options.provisioned)
+    if (options.provisioned ?? options.provisionStatus)
       commands.push({
         id: "cmd_0",
         botId: "bot_1",
         action: "provision",
-        status: "done",
+        status: options.provisionStatus ?? "done",
         payload: "{}",
         createdAt: new Date(),
       });
@@ -1105,12 +1106,19 @@ describe("hermes provisioning lifecycle", () => {
           commands.push(row);
           return row;
         },
-        findFirst: async ({ where }: { where: { botId?: string; action?: string; status?: string } }) =>
+        findFirst: async ({
+          where,
+        }: {
+          where: { botId?: string; action?: string; status?: string | { in: string[] } };
+        }) =>
           commands.find(
             (row) =>
               (where.botId === undefined || row.botId === where.botId) &&
               (where.action === undefined || row.action === where.action) &&
-              (where.status === undefined || row.status === where.status),
+              (where.status === undefined ||
+                (typeof where.status === "string"
+                  ? row.status === where.status
+                  : where.status.in.includes(row.status as string))),
           ) ?? null,
       },
       // archiveBot / destroyBot surface
@@ -1290,6 +1298,44 @@ describe("hermes provisioning lifecycle", () => {
     expect(tokenRows).toHaveLength(1);
     expect(tokenRows[0]).toMatchObject({
       tokenHash: createHash("sha256").update(token).digest("hex"),
+    });
+  });
+
+  it("token issue while a provision is still queued propagates as update, not a second provision", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, actor, handler } = lifecycleDeps({ provisionStatus: "queued" });
+
+    const res = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+
+    expect(res.status).toBe(200);
+    const token = res.json.json.token as string;
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toMatchObject({ botId: "bot_1", action: "update" });
+    expect(JSON.parse(commands[1]!.payload as string)).toEqual({
+      name: "rakazo-bot_1",
+      token,
+    });
+  });
+
+  it("token issue after a failed provision re-issues the full provision (repair path)", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, actor, handler } = lifecycleDeps({ provisionStatus: "failed" });
+
+    const res = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+
+    expect(res.status).toBe(200);
+    const token = res.json.json.token as string;
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toMatchObject({ botId: "bot_1", action: "provision" });
+    const payload = JSON.parse(commands[1]!.payload as string) as Record<string, string>;
+    expect(payload).toMatchObject({
+      name: "rakazo-bot_1",
+      soul: "be helpful",
+      url: "https://api.rakazo.example",
+      threadId: "thread_home",
+      token,
     });
   });
 
