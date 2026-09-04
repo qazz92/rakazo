@@ -3,7 +3,7 @@ import { RPCHandler } from "@orpc/server/fetch";
 import { COMPUTER_SCREEN_UNAVAILABLE, ComputerScreenUnavailableError } from "@rakazo/adapters";
 import type { Actor } from "@rakazo/contracts";
 import type { PrismaClient } from "@rakazo/db";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRouter, type RouterDeps } from "./router.js";
 
 describe("account preferences", () => {
@@ -997,5 +997,285 @@ describe("threads.followUp hermes routing", () => {
     });
     expect(sendUserMessage).not.toHaveBeenCalled();
     expect(enqueued).toEqual([]);
+  });
+});
+
+describe("hermes provisioning lifecycle", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  function lifecycleDeps(
+    options: { archivedAt?: Date; hermesTokenRow?: Record<string, unknown> | null } = {},
+  ) {
+    const commands: Array<Record<string, unknown>> = [];
+    const tokenRows: Array<Record<string, unknown>> = [];
+    const ops: string[] = [];
+    const botRow: Record<string, unknown> = {
+      id: "bot_1",
+      spaceId: "workspace-1",
+      userId: "user-1",
+      name: "Hermes",
+      title: "",
+      description: "",
+      instructions: "be helpful",
+      notifyOnFinish: true,
+      color: "#111111",
+      pinned: false,
+      sectionId: null,
+      archivedAt: options.archivedAt ?? null,
+      parentBotId: null,
+      memoryScope: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      computerId: undefined,
+      thread: { id: "thread_home", unread: false, messages: [] },
+      runs: [],
+      computer: null,
+    };
+    const prisma = {
+      // createBot surface
+      deploymentSettings: { findUnique: async () => null },
+      bot: {
+        count: async () => 0,
+        aggregate: async () => ({ _max: { position: null } }),
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ ...botRow, ...data }),
+        findFirst: async () => botRow,
+        findFirstOrThrow: async () => botRow,
+        findMany: async () => [botRow],
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          // Real prisma skips undefined fields; the fake must too or the
+          // returned bot loses fields the output schema requires.
+          const defined = Object.fromEntries(
+            Object.entries(data).filter(([, value]) => value !== undefined),
+          );
+          return Object.assign(botRow, defined);
+        },
+        delete: async () => {
+          ops.push("bot:delete");
+          return botRow;
+        },
+      },
+      computer: {
+        upsert: async () => ({ id: "computer_team" }),
+        findUnique: async () => null,
+        updateMany: async () => ({ count: 0 }),
+        delete: async () => ({}),
+      },
+      thread: { create: async () => ({ id: "thread_home" }) },
+      browserProfile: { create: async () => ({}) },
+      memoryDocument: { create: async () => ({}) },
+      hermesBotToken: {
+        upsert: async ({
+          where,
+          update,
+          create,
+        }: {
+          where: { botId: string };
+          update: Record<string, unknown>;
+          create: Record<string, unknown>;
+        }) => {
+          ops.push("token:upsert");
+          const existing = tokenRows.find((row) => row.botId === where.botId);
+          if (existing) return Object.assign(existing, update);
+          const row = { ...create };
+          tokenRows.push(row);
+          return row;
+        },
+        findFirst: async ({ where }: { where: { botId: string } }) =>
+          options.hermesTokenRow === null
+            ? null
+            : (options.hermesTokenRow ?? { id: "token_1", botId: where.botId }),
+      },
+      hermesCommand: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          ops.push("command:create");
+          const row = { id: `cmd_${commands.length + 1}`, ...data };
+          commands.push(row);
+          return row;
+        },
+      },
+      // archiveBot / destroyBot surface
+      run: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
+      routine: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
+      task: { updateMany: async () => ({ count: 0 }) },
+      attempt: { updateMany: async () => ({ count: 0 }) },
+      computerExecutionLease: {
+        updateMany: async () => ({ count: 0 }),
+        deleteMany: async () => ({ count: 0 }),
+      },
+      artifact: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
+      chatGroup: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
+      chatGroupMember: { deleteMany: async () => ({ count: 0 }) },
+      botDeletion: { create: async () => ({}) },
+      secret: { deleteMany: async () => ({ count: 0 }) },
+      message: { findMany: async () => [] },
+      $queryRaw: async () => [],
+      $executeRaw: async () => 0,
+      $transaction: async (arg: unknown) =>
+        Array.isArray(arg)
+          ? Promise.all(arg as unknown[])
+          : (arg as (tx: unknown) => unknown)(prisma),
+    } as unknown as PrismaClient;
+    const deps = {
+      prisma,
+      env: {
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+      home: {},
+    } as unknown as RouterDeps;
+    const actor = {
+      spaceId: "workspace-1",
+      userId: "user-1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    return { commands, tokenRows, ops, actor, handler: new RPCHandler(createRouter(deps)) };
+  }
+
+  async function call(handler: RPCHandler<never>, actor: Actor, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return { status: response.status, json: await response.json() };
+  }
+
+  it("bots.create provisions a hermes bot when the channel env is set", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, tokenRows, ops, actor, handler } = lifecycleDeps();
+
+    const res = await call(handler, actor, "bots/create", { name: "Hermes", color: "#123456" });
+
+    expect(res.status).toBe(200);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ botId: "bot_1", action: "provision" });
+    const payload = JSON.parse(commands[0]!.payload as string) as Record<string, string>;
+    expect(payload).toMatchObject({
+      name: "rakazo-bot_1",
+      soul: "be helpful",
+      url: "https://api.rakazo.example",
+      threadId: "thread_home",
+    });
+    expect(payload.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // Only the hash is stored; the plaintext lives in the queued payload alone.
+    expect(tokenRows).toEqual([
+      {
+        botId: "bot_1",
+        spaceId: "workspace-1",
+        tokenHash: createHash("sha256").update(payload.token!).digest("hex"),
+      },
+    ]);
+    expect(JSON.stringify(tokenRows)).not.toContain(payload.token!);
+    expect(JSON.stringify(res.json)).not.toContain(payload.token!);
+    expect(ops.indexOf("token:upsert")).toBeLessThan(ops.indexOf("command:create"));
+  });
+
+  it("bots.create skips provisioning when the channel env is unset", async () => {
+    const { commands, tokenRows, actor, handler } = lifecycleDeps();
+
+    const res = await call(handler, actor, "bots/create", { name: "Local", color: "#123456" });
+
+    expect(res.status).toBe(200);
+    expect(commands).toHaveLength(0);
+    expect(tokenRows).toHaveLength(0);
+  });
+
+  it("persona updates enqueue an update command; other updates do not", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, actor, handler } = lifecycleDeps();
+
+    const persona = await call(handler, actor, "bots/update", {
+      botId: "bot_1",
+      instructions: "new soul",
+    });
+    expect(persona.status).toBe(200);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ botId: "bot_1", action: "update" });
+    expect(JSON.parse(commands[0]!.payload as string)).toEqual({
+      name: "rakazo-bot_1",
+      soul: "new soul",
+    });
+
+    const cosmetic = await call(handler, actor, "bots/update", { botId: "bot_1", pinned: true });
+    expect(cosmetic.status).toBe(200);
+    expect(commands).toHaveLength(1);
+  });
+
+  it("archive enqueues stop and restore enqueues start", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const archived = lifecycleDeps();
+    const res = await call(archived.handler, archived.actor, "bots/archive", { botId: "bot_1" });
+    expect(res.status).toBe(200);
+    expect(archived.commands).toHaveLength(1);
+    expect(archived.commands[0]).toMatchObject({ botId: "bot_1", action: "stop" });
+    expect(JSON.parse(archived.commands[0]!.payload as string)).toEqual({ name: "rakazo-bot_1" });
+
+    const restored = lifecycleDeps({ archivedAt: new Date("2026-09-04T00:00:00Z") });
+    const restoreRes = await call(restored.handler, restored.actor, "bots/restore", {
+      botId: "bot_1",
+    });
+    expect(restoreRes.status).toBe(200);
+    expect(restored.commands).toHaveLength(1);
+    expect(restored.commands[0]).toMatchObject({ botId: "bot_1", action: "start" });
+    expect(JSON.parse(restored.commands[0]!.payload as string)).toEqual({ name: "rakazo-bot_1" });
+  });
+
+  it("remove enqueues deprovision before destroying the bot", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, ops, actor, handler } = lifecycleDeps();
+
+    const res = await call(handler, actor, "bots/remove", {
+      botId: "bot_1",
+      deleteMemories: true,
+    });
+
+    expect(res.status).toBe(200);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ botId: "bot_1", action: "deprovision" });
+    expect(JSON.parse(commands[0]!.payload as string)).toEqual({ name: "rakazo-bot_1" });
+    expect(ops.indexOf("command:create")).toBeLessThan(ops.indexOf("bot:delete"));
+  });
+
+  it("token re-issue propagates the fresh token as an update command", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, tokenRows, actor, handler } = lifecycleDeps();
+
+    const res = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+
+    expect(res.status).toBe(200);
+    const token = res.json.json.token as string;
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ botId: "bot_1", action: "update" });
+    expect(JSON.parse(commands[0]!.payload as string)).toEqual({
+      name: "rakazo-bot_1",
+      token,
+    });
+    expect(tokenRows[0]).toMatchObject({
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+    });
+    expect(JSON.stringify(tokenRows)).not.toContain(token);
+  });
+
+  it("token issue for a non-hermes bot enqueues nothing", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, actor, handler } = lifecycleDeps({ hermesTokenRow: null });
+
+    const res = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+
+    expect(res.status).toBe(200);
+    expect(commands).toHaveLength(0);
   });
 });

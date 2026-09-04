@@ -1144,3 +1144,20 @@ model HermesTurn {
   @@index([botId, status, createdAt])
   @@map("hermes_turns")
 }
+
+/// Fork: provisioning command consumed by the mini's supervisor.
+/// payload holds the bot token in plain text ONLY while status=queued|delivered;
+/// it is zeroed on completion (see commands/:id/result).
+model HermesCommand {
+  id        String    @id @default(cuid())
+  botId     String
+  action    String
+  payload   String
+  status    String    @default("queued")
+  result    String?
+  createdAt DateTime  @default(now())
+  doneAt    DateTime?
+
+  @@index([status, createdAt])
+  @@map("hermes_commands")
+}

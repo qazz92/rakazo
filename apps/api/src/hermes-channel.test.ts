@@ -5,7 +5,7 @@ import {
   type ThreadEvents,
 } from "@rakazo/db";
 import { Hono } from "hono";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HERMES_CHANNEL_BASE_PATH,
   mountHermesChannelRoutes,
@@ -387,5 +387,195 @@ describe("hermes channel POST /turns/:turnId/reply", () => {
     await expect(nullBody.json()).resolves.toEqual({ error: "Invalid JSON" });
 
     expect(createMessage).not.toHaveBeenCalled();
+  });
+});
+
+interface FakeCommand {
+  id: string;
+  botId: string;
+  action: string;
+  payload: string;
+  status: string;
+  createdAt: Date;
+  result?: string | null;
+  doneAt?: Date | null;
+}
+
+function commandFake(rows: FakeCommand[]) {
+  return {
+    findFirst: async ({ where }: { where: { status: string } }) =>
+      rows
+        .filter((c) => c.status === where.status)
+        .sort((a, b) => +new Date(a.createdAt) - +new Date(b.createdAt))[0] ?? null,
+    updateMany: async ({
+      where,
+      data,
+    }: {
+      where: { id: string; status: string };
+      data: Record<string, unknown>;
+    }) => {
+      let count = 0;
+      for (const c of rows)
+        if (c.id === where.id && c.status === where.status) {
+          Object.assign(c, data);
+          count++;
+        }
+      return { count };
+    },
+    findUniqueOrThrow: async ({
+      where,
+      select,
+    }: {
+      where: { id: string };
+      select?: Record<string, boolean>;
+    }) => {
+      const row = rows.find((c) => c.id === where.id);
+      if (!row) throw new Error(`hermesCommand ${where.id} not found`);
+      if (!select) return row;
+      return Object.fromEntries(
+        Object.keys(select).map((key) => [key, (row as unknown as Record<string, unknown>)[key]]),
+      );
+    },
+  };
+}
+
+describe("hermes commands channel", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  function mountCommands(commands: FakeCommand[]) {
+    const app = new Hono();
+    mountHermesChannelRoutes(app, {
+      // Structural fake: only the hermesCommand table backs these routes.
+      prisma: {
+        ...fakePrisma({ tokens: [], bots: [], turns: [], runs: [], messages: [] }),
+        hermesCommand: commandFake(commands),
+      } as unknown as PrismaClient,
+      events: { notify: vi.fn() } as unknown as ThreadEvents,
+    });
+    return app;
+  }
+
+  it("401s when the deploy token env is unset and when the token is wrong", async () => {
+    const app = mountCommands([]);
+    const unset = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/next`, {
+      method: "POST",
+      headers: { authorization: "Bearer anything" },
+    });
+    expect(unset.status).toBe(401);
+
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    const wrong = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/next`, {
+      method: "POST",
+      headers: { authorization: "Bearer not-the-deploy-token" },
+    });
+    expect(wrong.status).toBe(401);
+  });
+
+  it("claims the queued provision command and marks it delivered", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    const commands: FakeCommand[] = [
+      { id: "c1", botId: "bot_1", action: "provision", payload: '{"token":"bot-secret"}', status: "queued", createdAt: new Date("2026-09-04T01:00:00Z") },
+      { id: "c2", botId: "bot_2", action: "update", payload: "{}", status: "queued", createdAt: new Date("2026-09-04T02:00:00Z") },
+    ];
+    const app = mountCommands(commands);
+
+    const res = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/next`, {
+      method: "POST",
+      headers: { authorization: "Bearer deploy-secret" },
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      id: "c1",
+      action: "provision",
+      payload: '{"token":"bot-secret"}',
+    });
+    expect(commands[0]!.status).toBe("delivered");
+    // The newer command stays queued for the next poll.
+    expect(commands[1]!.status).toBe("queued");
+  });
+
+  it("result zeroes the payload on completion and 404s when nothing is delivered", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    const commands: FakeCommand[] = [
+      { id: "c1", botId: "bot_1", action: "provision", payload: '{"token":"bot-secret"}', status: "delivered", createdAt: new Date() },
+      { id: "c2", botId: "bot_2", action: "update", payload: "{}", status: "queued", createdAt: new Date() },
+    ];
+    const app = mountCommands(commands);
+
+    const ok = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/c1/result`, {
+      method: "POST",
+      headers: { authorization: "Bearer deploy-secret", "content-type": "application/json" },
+      body: JSON.stringify({ ok: true }),
+    });
+    expect(ok.status).toBe(200);
+    await expect(ok.json()).resolves.toEqual({ ok: true });
+    expect(commands[0]).toMatchObject({ status: "done", payload: "{}", result: null });
+    expect(commands[0]!.doneAt).toBeInstanceOf(Date);
+    // The plaintext bot token is discarded on completion.
+    expect(JSON.stringify(commands[0])).not.toContain("bot-secret");
+
+    // Already done, and a still-queued command: neither is reportable.
+    for (const id of ["c1", "c2"]) {
+      const repeat = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/${id}/result`, {
+        method: "POST",
+        headers: { authorization: "Bearer deploy-secret", "content-type": "application/json" },
+        body: JSON.stringify({ ok: false, detail: "boom" }),
+      });
+      expect(repeat.status).toBe(404);
+    }
+    expect(commands[1]!.status).toBe("queued");
+  });
+
+  it("marks a delivered command failed with its detail", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    const commands: FakeCommand[] = [
+      { id: "c1", botId: "bot_1", action: "provision", payload: '{"token":"bot-secret"}', status: "delivered", createdAt: new Date() },
+    ];
+    const app = mountCommands(commands);
+
+    const res = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/c1/result`, {
+      method: "POST",
+      headers: { authorization: "Bearer deploy-secret", "content-type": "application/json" },
+      body: JSON.stringify({ ok: false, detail: "profile create failed" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(commands[0]).toMatchObject({
+      status: "failed",
+      result: "profile create failed",
+      payload: "{}",
+    });
+  });
+
+  it("400s on a non-object result body and 401s without the deploy token", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    const commands: FakeCommand[] = [
+      { id: "c1", botId: "bot_1", action: "provision", payload: "{}", status: "delivered", createdAt: new Date() },
+    ];
+    const app = mountCommands(commands);
+
+    const nullBody = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/c1/result`, {
+      method: "POST",
+      headers: { authorization: "Bearer deploy-secret", "content-type": "application/json" },
+      body: "null",
+    });
+    expect(nullBody.status).toBe(400);
+
+    const badJson = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/c1/result`, {
+      method: "POST",
+      headers: { authorization: "Bearer deploy-secret", "content-type": "application/json" },
+      body: "not json",
+    });
+    expect(badJson.status).toBe(400);
+
+    const noToken = await app.request(`${HERMES_CHANNEL_BASE_PATH}/commands/c1/result`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: true }),
+    });
+    expect(noToken.status).toBe(401);
+    // Nothing was consumed by the rejected attempts.
+    expect(commands[0]!.status).toBe("delivered");
   });
 });

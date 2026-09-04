@@ -125,7 +125,13 @@ import {
   resolveBusyBotName,
   toComputerStatus,
 } from "./computer-status.js";
-import { assertNoHermesMembers, isHermesBot } from "./hermes-channel.js";
+import {
+  assertNoHermesMembers,
+  hermesChannelEnabled,
+  hookHermesLifecycle,
+  isHermesBot,
+  provisionHermesBot,
+} from "./hermes-channel.js";
 import { buildMcpUpdateMaterial } from "./mcp-material.js";
 import { chooseFocus, markAppConnected, startOnboarding } from "./onboarding.js";
 import { listSpaceRuns } from "./runs.js";
@@ -646,9 +652,12 @@ export function createRouter(deps: RouterDeps) {
         if (!found) throw new IsolationError();
         return found;
       }),
-      create: authed.bots.create.handler(async ({ context, input }) =>
-        repos.createBot(context.actor, input),
-      ),
+      create: authed.bots.create.handler(async ({ context, input }) => {
+        const bot = await repos.createBot(context.actor, input);
+        // rakazo-fork: hermes — provision the new bot as a hermes profile (body: hermes-channel.ts)
+        if (hermesChannelEnabled()) await provisionHermesBot(deps.prisma, bot);
+        return bot;
+      }),
       duplicate: authed.bots.duplicate.handler(async ({ context, input }) => {
         const source = await repos.getBot(context.actor, input.botId);
         const duplicate = await repos.createBot(context.actor, {
@@ -761,6 +770,13 @@ export function createRouter(deps: RouterDeps) {
         const bots = await repos.listBots(context.actor);
         const bot = bots.find((b) => b.id === input.botId);
         if (!bot) throw new IsolationError();
+        // rakazo-fork: hermes — persona edits propagate to the profile (body: hermes-channel.ts)
+        if (
+          hermesChannelEnabled() &&
+          ["instructions", "name", "title"].some((field) => field in input) &&
+          (await isHermesBot(deps.prisma, bot.id))
+        )
+          await hookHermesLifecycle(deps.prisma, bot, "update");
         return bot;
       }),
       setComputer: authed.bots.setComputer.handler(async ({ context, input }) => {
@@ -833,16 +849,25 @@ export function createRouter(deps: RouterDeps) {
           bot,
           computerContext(context.actor, bot.id, "archive"),
         );
+        // rakazo-fork: hermes — archived bots stop their profile gateway (body: hermes-channel.ts)
+        if (hermesChannelEnabled() && (await isHermesBot(deps.prisma, bot.id)))
+          await hookHermesLifecycle(deps.prisma, bot, "stop");
         return { ok: true as const };
       }),
       restore: authed.bots.restore.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId, { includeArchived: true });
         if (!bot.archivedAt) return { ok: true as const };
         await deps.prisma.bot.update({ where: { id: bot.id }, data: { archivedAt: null } });
+        // rakazo-fork: hermes — restored bots restart their profile gateway (body: hermes-channel.ts)
+        if (hermesChannelEnabled() && (await isHermesBot(deps.prisma, bot.id)))
+          await hookHermesLifecycle(deps.prisma, bot, "start");
         return { ok: true as const };
       }),
       remove: authed.bots.remove.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId, { includeArchived: true });
+        // rakazo-fork: hermes — deprovision before the row cascade deletes the token (body: hermes-channel.ts)
+        if (hermesChannelEnabled() && (await isHermesBot(deps.prisma, bot.id)))
+          await hookHermesLifecycle(deps.prisma, bot, "deprovision");
         await destroyBot(
           {
             prisma: deps.prisma,
@@ -922,6 +947,9 @@ export function createRouter(deps: RouterDeps) {
             update: { tokenHash, revokedAt: null },
             create: { botId: bot.id, spaceId: context.actor.spaceId, tokenHash },
           });
+          // rakazo-fork: hermes — rotate the profile's env token (body: hermes-channel.ts)
+          if (hermesChannelEnabled() && (await isHermesBot(deps.prisma, bot.id)))
+            await hookHermesLifecycle(deps.prisma, { id: bot.id }, "update", { token });
           return { token };
         }),
         revoke: authed.bots.hermesToken.revoke.handler(async ({ context, input }) => {

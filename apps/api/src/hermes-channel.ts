@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import type { Hono } from "hono";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   appendEventInTransaction,
   createThreadMessageInTransaction,
@@ -27,6 +27,19 @@ export function bearerToken(request: Request): string | null {
   if (!header?.startsWith("Bearer ")) return null;
   const token = header.slice(7).trim();
   return token || null;
+}
+
+/** Both channel env vars must be set for provisioning hooks to fire;
+ * unset keeps rakazo fully local (upstream behavior). */
+export function hermesChannelEnabled(): boolean {
+  return Boolean(process.env.HERMES_DEPLOY_TOKEN && process.env.HERMES_PUBLIC_URL);
+}
+
+/** The supervisor's shared deploy token (not per-bot). Unset env never authenticates. */
+export function resolveDeployToken(token: string): boolean {
+  const expected = process.env.HERMES_DEPLOY_TOKEN;
+  if (!expected) return false;
+  return sha256Token(token) === sha256Token(expected);
 }
 
 /** Resolve a bearer token to its bot. Revoked tokens, archived bots, and
@@ -69,6 +82,87 @@ export async function claimNextHermesTurn(
   return prisma.hermesTurn.findUniqueOrThrow({
     where: { id: next.id },
     select: { id: true, threadId: true, prompt: true },
+  });
+}
+
+/** Same atomic claim pattern as turns: the updateMany status guard means two
+ * concurrent supervisor pollers can never take the same command. */
+export async function claimNextHermesCommand(
+  prisma: Pick<PrismaClient, "hermesCommand">,
+): Promise<{ id: string; action: string; payload: string } | null> {
+  const next = await prisma.hermesCommand.findFirst({
+    where: { status: "queued" },
+    orderBy: { createdAt: "asc" },
+    select: { id: true },
+  });
+  if (!next) return null;
+  const claimed = await prisma.hermesCommand.updateMany({
+    where: { id: next.id, status: "queued" },
+    data: { status: "delivered" },
+  });
+  if (claimed.count === 0) return null; // ponytail: raced poller won — caller's next loop iteration retries
+  return prisma.hermesCommand.findUniqueOrThrow({
+    where: { id: next.id },
+    select: { id: true, action: true, payload: true },
+  });
+}
+
+export async function enqueueHermesCommand(
+  prisma: Pick<PrismaClient, "hermesCommand">,
+  botId: string,
+  action: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await prisma.hermesCommand.create({
+    data: { botId, action, payload: JSON.stringify(payload) },
+  });
+}
+
+/**
+ * Fork: bot creation = hermes provisioning. Mints the bot's channel token and
+ * queues the provision command the supervisor turns into `hermes profile
+ * create rakazo-<botId> --clone-from rakazo-template` + env injection. The
+ * token's plaintext rides only in the queued payload (zeroed on completion)
+ * and as a sha256 hash in hermesBotToken.
+ */
+export async function provisionHermesBot(
+  prisma: Pick<PrismaClient, "hermesBotToken" | "hermesCommand">,
+  bot: { id: string; spaceId: string; instructions: string; threadId: string },
+): Promise<void> {
+  const token = randomBytes(32).toString("base64url");
+  const tokenHash = sha256Token(token);
+  // botId is unique: upsert resets the hash in place (rotation ruling) —
+  // revoke-then-create would P2002 on the unique botId. Upsert first so a
+  // failed enqueue can never orphan a command whose token rakazo never stored.
+  await prisma.hermesBotToken.upsert({
+    where: { botId: bot.id },
+    update: { tokenHash, revokedAt: null },
+    create: { botId: bot.id, spaceId: bot.spaceId, tokenHash },
+  });
+  await enqueueHermesCommand(prisma, bot.id, "provision", {
+    name: `rakazo-${bot.id}`,
+    soul: bot.instructions,
+    url: process.env.HERMES_PUBLIC_URL,
+    threadId: bot.threadId,
+    token,
+  });
+}
+
+/**
+ * Fork: bot lifecycle → supervisor command. provision comes from
+ * provisionHermesBot; every later transition routes through here as
+ * update (persona) | stop (archive) | start (restore) | deprovision (remove).
+ */
+export async function hookHermesLifecycle(
+  prisma: Pick<PrismaClient, "hermesCommand">,
+  bot: { id: string; instructions?: string | null },
+  action: "update" | "stop" | "start" | "deprovision" | "rotate",
+  extra: { token?: string } = {},
+): Promise<void> {
+  await enqueueHermesCommand(prisma, bot.id, action, {
+    name: `rakazo-${bot.id}`,
+    ...(action === "update" && bot.instructions != null ? { soul: bot.instructions } : {}),
+    ...extra,
   });
 }
 
@@ -303,5 +397,44 @@ export function mountHermesChannelRoutes(
       });
     }
     return c.json({ ok: true, messageId: committed.messageId });
+  });
+
+  // The supervisor (not a bot profile) long-polls provisioning commands with
+  // the shared deploy token and reports each outcome back.
+  app.post(`${HERMES_CHANNEL_BASE_PATH}/commands/next`, async (c) => {
+    const token = bearerToken(c.req.raw);
+    if (!token || !resolveDeployToken(token)) return c.json({ error: "Unauthorized" }, 401);
+    const deadline = Date.now() + POLL_MAX_MS;
+    while (Date.now() < deadline) {
+      const command = await claimNextHermesCommand(deps.prisma);
+      if (command) return c.json(command);
+      await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+    return c.json({ timeout: true });
+  });
+
+  app.post(`${HERMES_CHANNEL_BASE_PATH}/commands/:id/result`, async (c) => {
+    const token = bearerToken(c.req.raw);
+    if (!token || !resolveDeployToken(token)) return c.json({ error: "Unauthorized" }, 401);
+    let body: { ok?: boolean; detail?: string };
+    try {
+      // A literal `null` (or scalar) parses without throwing — guard before field access.
+      const parsed: unknown = await c.req.json();
+      if (!parsed || typeof parsed !== "object") return c.json({ error: "Invalid JSON" }, 400);
+      body = parsed as typeof body;
+    } catch {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+    const updated = await deps.prisma.hermesCommand.updateMany({
+      where: { id: c.req.param("id"), status: "delivered" },
+      data: {
+        status: body.ok ? "done" : "failed",
+        result: body.detail ?? null,
+        payload: "{}", // discard the plaintext bot token
+        doneAt: new Date(),
+      },
+    });
+    if (updated.count === 0) return c.json({ error: "Not found" }, 404);
+    return c.json({ ok: true });
   });
 }
