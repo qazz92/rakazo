@@ -130,6 +130,7 @@ import {
   hermesChannelEnabled,
   hookHermesLifecycle,
   isHermesBot,
+  propagateHermesToken,
   provisionHermesBot,
 } from "./hermes-channel.js";
 import { buildMcpUpdateMaterial } from "./mcp-material.js";
@@ -935,7 +936,7 @@ export function createRouter(deps: RouterDeps) {
         issue: authed.bots.hermesToken.issue.handler(async ({ context, input }) => {
           const bot = await deps.prisma.bot.findFirst({
             where: { id: input.botId, spaceId: context.actor.spaceId, archivedAt: null },
-            select: { id: true },
+            select: { id: true, instructions: true, thread: { select: { id: true } } },
           });
           if (!bot) throw new IsolationError();
           const token = randomBytes(32).toString("base64url");
@@ -947,9 +948,12 @@ export function createRouter(deps: RouterDeps) {
             update: { tokenHash, revokedAt: null },
             create: { botId: bot.id, spaceId: context.actor.spaceId, tokenHash },
           });
-          // rakazo-fork: hermes — rotate the profile's env token (body: hermes-channel.ts)
-          if (hermesChannelEnabled() && (await isHermesBot(deps.prisma, bot.id)))
-            await hookHermesLifecycle(deps.prisma, { id: bot.id }, "update", { token });
+          if (bot.thread && hermesChannelEnabled() && (await isHermesBot(deps.prisma, bot.id)))
+            await propagateHermesToken(
+              deps.prisma,
+              { id: bot.id, instructions: bot.instructions, threadId: bot.thread.id },
+              token,
+            );
           return { token };
         }),
         revoke: authed.bots.hermesToken.revoke.handler(async ({ context, input }) => {

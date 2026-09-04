@@ -327,7 +327,15 @@ describe("hermes channel POST /turns/:turnId/reply", () => {
       runId: "run_1",
       payload: { messageId: "m0", role: "bot", blocks: [{ kind: "text", text: "hermes 답" }] },
     });
-    expect(notify).toHaveBeenCalledWith("thread_1", 1);
+    expect(notify).toHaveBeenCalledWith("thread_1", 2); // last event's seq
+    expect(events[1]).toMatchObject({
+      spaceId: "space_1",
+      threadId: "thread_1",
+      botId: "bot_1",
+      type: "run.completed",
+      runId: "run_1",
+      payload: {},
+    });
   });
 
   it("ad-hoc replies append an event without a run; nonce replays are duplicates", async () => {
@@ -342,6 +350,7 @@ describe("hermes channel POST /turns/:turnId/reply", () => {
     await expect(first.json()).resolves.toEqual({ ok: true, messageId: "m0" });
     expect(events[0]).toMatchObject({ type: "thread.message.created", threadId: "thread_1" });
     expect(events[0]!.runId).toBeUndefined();
+    expect(events.some((event) => event.type === "run.completed")).toBe(false);
     expect(notify).toHaveBeenCalledWith("thread_1", 1);
 
     const replay = await app.request(`${HERMES_CHANNEL_BASE_PATH}/turns/ad-hoc/reply`, postReply(body));

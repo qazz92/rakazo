@@ -177,6 +177,36 @@ export async function isHermesBot(
   return token !== null;
 }
 
+/**
+ * Fork: token propagation after hermesToken.issue. A bot with no completed
+ * provision has no profile yet — the supervisor's update handler would fail
+ * "profile does not exist" and the bot would queue user messages forever —
+ * so the first issue must enqueue the full provision payload instead.
+ */
+export async function propagateHermesToken(
+  prisma: Pick<PrismaClient, "hermesCommand">,
+  bot: { id: string; instructions: string; threadId: string },
+  token: string,
+): Promise<void> {
+  const provisioned = await prisma.hermesCommand.findFirst({
+    where: { botId: bot.id, action: "provision", status: "done" },
+    select: { id: true },
+  });
+  if (provisioned) {
+    await enqueueHermesCommand(prisma, bot.id, "update", {
+      name: `rakazo-${bot.id}`,
+      token,
+    });
+    return;
+  }
+  await enqueueHermesCommand(prisma, bot.id, "provision", {
+    name: `rakazo-${bot.id}`,
+    soul: bot.instructions,
+    url: process.env.HERMES_PUBLIC_URL,
+    threadId: bot.threadId,
+    token,
+  });
+}
 /** Fan-out guard: a hermes member in a group thread would answer as one of
  *  many voices with no PM to coordinate — team bots stay in 1:1 threads. */
 export async function assertNoHermesMembers(
@@ -370,7 +400,7 @@ export function mountHermesChannelRoutes(
             await tx.run.update({ where: { id: runId }, data: { status: "completed" } });
           }
         }
-        const event = await appendEventInTransaction(tx, {
+        const messageEvent = await appendEventInTransaction(tx, {
           spaceId: auth.spaceId,
           threadId,
           botId: auth.botId,
@@ -378,7 +408,22 @@ export function mountHermesChannelRoutes(
           runId: runId ?? undefined,
           payload: { messageId: message.id, role: "bot", blocks },
         });
-        return { messageId: message.id, eventSeq: event.seq };
+        // Fork: mirror finalizeRun — the web client clears live run state only
+        // on run.completed/failed/cancelled, so a turn with a companion Run
+        // must append the terminal event here or the thread UI stays busy.
+        let eventSeq = messageEvent.seq;
+        if (runId) {
+          const completedEvent = await appendEventInTransaction(tx, {
+            spaceId: auth.spaceId,
+            threadId,
+            botId: auth.botId,
+            type: "run.completed",
+            runId,
+            payload: {},
+          });
+          eventSeq = completedEvent.seq;
+        }
+        return { messageId: message.id, eventSeq };
       });
     } catch (error) {
       // Race guard: a concurrent reply with the same nonce lost the

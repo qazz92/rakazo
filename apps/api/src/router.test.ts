@@ -1004,10 +1004,23 @@ describe("hermes provisioning lifecycle", () => {
   afterEach(() => vi.unstubAllEnvs());
 
   function lifecycleDeps(
-    options: { archivedAt?: Date; hermesTokenRow?: Record<string, unknown> | null } = {},
+    options: {
+      archivedAt?: Date;
+      hermesTokenRow?: Record<string, unknown> | null;
+      provisioned?: boolean;
+    } = {},
   ) {
     const commands: Array<Record<string, unknown>> = [];
     const tokenRows: Array<Record<string, unknown>> = [];
+    if (options.provisioned)
+      commands.push({
+        id: "cmd_0",
+        botId: "bot_1",
+        action: "provision",
+        status: "done",
+        payload: "{}",
+        createdAt: new Date(),
+      });
     const ops: string[] = [];
     const botRow: Record<string, unknown> = {
       id: "bot_1",
@@ -1092,6 +1105,13 @@ describe("hermes provisioning lifecycle", () => {
           commands.push(row);
           return row;
         },
+        findFirst: async ({ where }: { where: { botId?: string; action?: string; status?: string } }) =>
+          commands.find(
+            (row) =>
+              (where.botId === undefined || row.botId === where.botId) &&
+              (where.action === undefined || row.action === where.action) &&
+              (where.status === undefined || row.status === where.status),
+          ) ?? null,
       },
       // archiveBot / destroyBot surface
       run: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
@@ -1247,7 +1267,7 @@ describe("hermes provisioning lifecycle", () => {
     expect(ops.indexOf("command:create")).toBeLessThan(ops.indexOf("bot:delete"));
   });
 
-  it("token re-issue propagates the fresh token as an update command", async () => {
+  it("first token issue on a never-provisioned bot enqueues provision, not update", async () => {
     vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
     vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
     const { commands, tokenRows, actor, handler } = lifecycleDeps();
@@ -1257,8 +1277,34 @@ describe("hermes provisioning lifecycle", () => {
     expect(res.status).toBe(200);
     const token = res.json.json.token as string;
     expect(commands).toHaveLength(1);
-    expect(commands[0]).toMatchObject({ botId: "bot_1", action: "update" });
-    expect(JSON.parse(commands[0]!.payload as string)).toEqual({
+    expect(commands[0]).toMatchObject({ botId: "bot_1", action: "provision" });
+    const payload = JSON.parse(commands[0]!.payload as string) as Record<string, string>;
+    expect(payload).toMatchObject({
+      name: "rakazo-bot_1",
+      soul: "be helpful",
+      url: "https://api.rakazo.example",
+      threadId: "thread_home",
+      token,
+    });
+    // Only the hash is stored; the plaintext rides in the queued payload alone.
+    expect(tokenRows).toHaveLength(1);
+    expect(tokenRows[0]).toMatchObject({
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+    });
+  });
+
+  it("token re-issue after a completed provision propagates the fresh token as an update", async () => {
+    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
+    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
+    const { commands, tokenRows, actor, handler } = lifecycleDeps({ provisioned: true });
+
+    const res = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
+
+    expect(res.status).toBe(200);
+    const token = res.json.json.token as string;
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toMatchObject({ botId: "bot_1", action: "update" });
+    expect(JSON.parse(commands[1]!.payload as string)).toEqual({
       name: "rakazo-bot_1",
       token,
     });
@@ -1266,16 +1312,5 @@ describe("hermes provisioning lifecycle", () => {
       tokenHash: createHash("sha256").update(token).digest("hex"),
     });
     expect(JSON.stringify(tokenRows)).not.toContain(token);
-  });
-
-  it("token issue for a non-hermes bot enqueues nothing", async () => {
-    vi.stubEnv("HERMES_DEPLOY_TOKEN", "deploy-secret");
-    vi.stubEnv("HERMES_PUBLIC_URL", "https://api.rakazo.example");
-    const { commands, actor, handler } = lifecycleDeps({ hermesTokenRow: null });
-
-    const res = await call(handler, actor, "bots/hermesToken/issue", { botId: "bot_1" });
-
-    expect(res.status).toBe(200);
-    expect(commands).toHaveLength(0);
   });
 });
