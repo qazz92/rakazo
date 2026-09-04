@@ -878,3 +878,124 @@ describe("threads.send group hermes guard", () => {
     expect(turns).toHaveLength(0);
   });
 });
+
+describe("threads.followUp hermes routing", () => {
+  function followUpDeps(hermesToken: Record<string, unknown> | null) {
+    const turns: Array<Record<string, unknown>> = [];
+    const enqueued: unknown[] = [];
+    // Returns taskId+runId so the pre-fix local path would enqueue a run.continue job.
+    const sendUserMessage = vi.fn(async () => ({
+      messageId: "msg_send",
+      taskId: "task_send",
+      runId: "run_send",
+      seq: 1,
+    }));
+    let counter = 0;
+    const nextId = (prefix: string) => `${prefix}_${(counter += 1)}`;
+    const runs: Array<Record<string, unknown>> = [];
+    const prisma = {
+      $transaction: (callback: (client: unknown) => unknown) => callback(prisma),
+      bot: {
+        findFirst: async () => ({ id: "bot_1", thread: { id: "thread_1" }, computer: null }),
+      },
+      taughtSkill: { findFirst: async () => null },
+      hermesBotToken: { findFirst: async () => hermesToken },
+      hermesTurn: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("turn"), status: "queued", ...data };
+          turns.push(row);
+          return row;
+        },
+      },
+      thread: {
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          if ("nextMessageSeq" in data) return { nextMessageSeq: 1 };
+          return { nextEventSeq: 1 };
+        },
+      },
+      message: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({
+          id: nextId("message"),
+          ...data,
+        }),
+        update: async ({ where }: { where: { id: string } }) => ({ id: where.id }),
+      },
+      task: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: nextId("task"), ...data }),
+      },
+      run: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          const row = { id: nextId("run"), ...data };
+          runs.push(row);
+          return row;
+        },
+        findFirst: async () => null,
+        findUnique: async ({ where }: { where: { id: string } }) =>
+          runs.find((run) => run.id === where.id) ?? null,
+        updateMany: async () => ({ count: 0 }),
+      },
+      event: {
+        create: async ({ data }: { data: Record<string, unknown> }) => ({ id: nextId("event"), ...data }),
+      },
+    } as unknown as PrismaClient;
+    const deps = {
+      prisma,
+      events: { sendUserMessage, notify: async () => undefined },
+      jobs: { enqueue: async (job: unknown) => void enqueued.push(job) },
+      env: {
+        agentRuntime: "scripted",
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+      dataDir: "/tmp/rakazo-router-test",
+    } as unknown as RouterDeps;
+    const actor = {
+      spaceId: "workspace-1",
+      userId: "user-1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    return { turns, enqueued, sendUserMessage, actor, handler: new RPCHandler(createRouter(deps)) };
+  }
+
+  async function call(handler: RPCHandler<never>, actor: Actor, path: string, body: unknown) {
+    const { response } = await handler.handle(
+      new Request(`http://127.0.0.1/rpc/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: body }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+    return { status: response.status, json: await response.json() };
+  }
+
+  it("routes a hermes bot follow-up through the turn queue, not the local executor", async () => {
+    const { turns, enqueued, sendUserMessage, actor, handler } = followUpDeps({
+      id: "token_1",
+      botId: "bot_1",
+    });
+
+    const response = await call(handler, actor, "threads/followUp", {
+      botId: "bot_1",
+      text: "그다음엔?",
+    });
+
+    expect(response.status).toBe(200);
+    // followUp's own output contract — sendThreadMessage's {taskId, runId, seq} is discarded.
+    expect(response.json).toEqual({ json: { ok: true } });
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      botId: "bot_1",
+      threadId: "thread_1",
+      runId: expect.any(String),
+      prompt: "그다음엔?",
+      status: "queued",
+    });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(enqueued).toEqual([]);
+  });
+});

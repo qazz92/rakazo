@@ -1194,6 +1194,11 @@ export function createRouter(deps: RouterDeps) {
         const target = await resolveThreadTarget(deps.prisma, context.actor, input);
         if (target.kind === "bot") {
           await assertTeachingSendAllowed(deps.prisma, context.actor.spaceId, target.botId);
+          // rakazo-fork: hermes — follow-ups join the same turn queue as sends (body: hermes-channel.ts)
+          if (await isHermesBot(deps.prisma, target.botId)) {
+            await sendThreadMessage(deps, context.actor, target, input);
+            return { ok: true as const };
+          }
           const sent = await deps.events.sendUserMessage({
             spaceId: context.actor.spaceId,
             threadId: target.threadId,
