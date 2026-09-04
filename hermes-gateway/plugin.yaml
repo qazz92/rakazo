@@ -1,0 +1,20 @@
+name: rakazo
+label: Rakazo
+kind: platform
+version: 0.1.0
+description: Long-poll adapter for a Rakazo fork deployment (outbound-only; the Rakazo host needs no inbound access to this machine)
+author: rakazo-fork
+requires_env:
+  - name: RAKAZO_URL
+    description: "Base URL of the Rakazo deployment, e.g. https://rakazo.example.com"
+    prompt: "Rakazo URL"
+    password: false
+  - name: RAKAZO_TOKEN
+    description: "Per-bot hermes channel token issued by the Rakazo API"
+    prompt: "Token"
+    password: true
+optional_env:
+  - name: RAKAZO_HOME_CHANNEL
+    description: "Rakazo thread id used as home channel for cron delivery"
+    prompt: "Home thread id"
+    password: false
