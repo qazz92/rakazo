@@ -355,6 +355,7 @@ model Bot {
   steeringMessages  SteeringMessage[]
   mcpServers        BotMcpServer[]
   groupMembers      ChatGroupMember[]
+  hermesToken       HermesBotToken?
 
   @@unique([spaceId, spawnKey])
   @@index([spaceId, userId, archivedAt, pinned, updatedAt])
@@ -1107,4 +1108,39 @@ model AgentConnection {
   @@unique([requesterBotId, targetBotId])
   @@index([targetBotId, status])
   @@map("agent_connections")
+}
+
+/// Fork: per-bot long-lived token for the hermes channel adapter.
+/// Plain token is shown once at issuance; only sha256 hex is stored.
+model HermesBotToken {
+  id        String    @id @default(cuid())
+  botId     String    @unique
+  spaceId   String
+  tokenHash String    @unique
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+  bot       Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
+
+  @@index([spaceId])
+  @@map("hermes_bot_tokens")
+}
+
+/// Fork: one queued conversation turn waiting for the bot's hermes
+/// profile to long-poll it. status: queued | delivered | replied | cancelled.
+/// runId links the companion Run row that keeps the threads.send output
+/// contract ({taskId, runId, seq}) and UI run status intact.
+model HermesTurn {
+  id          String    @id @default(cuid())
+  spaceId     String
+  botId       String
+  threadId    String
+  runId       String
+  prompt      String
+  status      String    @default("queued")
+  createdAt   DateTime  @default(now())
+  deliveredAt DateTime?
+  repliedAt   DateTime?
+
+  @@index([botId, status, createdAt])
+  @@map("hermes_turns")
 }
