@@ -65,9 +65,10 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { type AppEnv, loadEnv } from "./env.js";
 import { createMessagingInboundHandler } from "./messaging-inbound.js";
-import { mountMessagingWebhookRoutes } from "./messaging-webhook.js";
+import { mountHermesChannelRoutes } from "./hermes-channel.js";
 import { createRouter } from "./router.js";
 import { mountVoiceHttpRoutes } from "./voice.js";
+import { mountMessagingWebhookRoutes } from "./messaging-webhook.js";
 import { mountWebhookHttpRoutes } from "./webhook.js";
 
 export interface AppHandles {
@@ -430,6 +431,7 @@ export async function createApp(
     });
     mountMessagingWebhookRoutes(app, { messaging });
   }
+  mountHermesChannelRoutes(app, { prisma, events });
 
   app.get("/health", (c) =>
     c.json({
