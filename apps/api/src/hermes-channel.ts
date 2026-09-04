@@ -1,6 +1,15 @@
 import type { Hono } from "hono";
 import { createHash } from "node:crypto";
-import type { PrismaClient, ThreadEvents } from "@rakazo/db";
+import {
+  appendEventInTransaction,
+  createThreadMessageInTransaction,
+  type PrismaClient,
+  type ThreadEvents,
+} from "@rakazo/db";
+
+function isUniqueViolation(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "P2002");
+}
 
 export const HERMES_CHANNEL_BASE_PATH = "/api/v1/hermes";
 
@@ -82,5 +91,86 @@ export function mountHermesChannelRoutes(
       await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
     return c.json({ timeout: true });
+  });
+
+  app.post(`${HERMES_CHANNEL_BASE_PATH}/turns/:turnId/reply`, async (c) => {
+    const token = bearerToken(c.req.raw);
+    const auth = token ? await resolveHermesToken(deps.prisma, token) : null;
+    if (!auth) return c.json({ error: "Unauthorized" }, 401);
+    let body: { threadId?: unknown; text?: unknown; clientNonce?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Invalid JSON" }, 400);
+    }
+    const threadId = typeof body.threadId === "string" ? body.threadId : "";
+    const text = typeof body.text === "string" ? body.text : "";
+    const clientNonce = typeof body.clientNonce === "string" ? body.clientNonce : "";
+    if (!threadId || !text.trim() || !clientNonce)
+      return c.json({ error: "threadId, text, and clientNonce are required" }, 400);
+    if (threadId !== auth.threadId)
+      return c.json({ error: "This token is not for that thread" }, 401);
+
+    const replayed = await deps.prisma.message.findFirst({
+      where: { threadId, clientNonce },
+      select: { id: true },
+    });
+    if (replayed) return c.json({ ok: true, messageId: replayed.id, duplicate: true });
+
+    const blocks = [{ kind: "text" as const, text }];
+    const turnId = c.req.param("turnId");
+    let committed: { messageId: string; eventSeq: number | null };
+    try {
+      committed = await deps.prisma.$transaction(async (tx) => {
+        const message = await createThreadMessageInTransaction(tx, {
+          threadId,
+          role: "bot",
+          blocks,
+          botId: auth.botId,
+          clientNonce,
+        });
+        let runId: string | null = null;
+        if (turnId !== "ad-hoc") {
+          const turn = await tx.hermesTurn.findFirst({
+            where: { id: turnId, botId: auth.botId, status: "delivered" },
+            select: { runId: true },
+          });
+          if (!turn) return { messageId: message.id, eventSeq: null };
+          runId = turn.runId;
+          await tx.hermesTurn.update({
+            where: { id: turnId },
+            data: { status: "replied", repliedAt: new Date() },
+          });
+          if (runId) {
+            await tx.run.update({ where: { id: runId }, data: { status: "completed" } });
+          }
+        }
+        const event = await appendEventInTransaction(tx, {
+          spaceId: auth.spaceId,
+          threadId,
+          botId: auth.botId,
+          type: "thread.message.created",
+          runId: runId ?? undefined,
+          payload: { messageId: message.id, role: "bot", blocks },
+        });
+        return { messageId: message.id, eventSeq: event.seq };
+      });
+    } catch (error) {
+      // Race guard: a concurrent reply with the same nonce lost the
+      // Message(threadId, clientNonce) unique race — surface the winner.
+      if (!isUniqueViolation(error)) throw error;
+      const winner = await deps.prisma.message.findFirst({
+        where: { threadId, clientNonce },
+        select: { id: true },
+      });
+      if (winner) return c.json({ ok: true, messageId: winner.id, duplicate: true });
+      throw error;
+    }
+    if (committed.eventSeq != null) {
+      await deps.events.notify(threadId, committed.eventSeq).catch((error) => {
+        console.error("hermes reply notify failed", error);
+      });
+    }
+    return c.json({ ok: true, messageId: committed.messageId });
   });
 }
