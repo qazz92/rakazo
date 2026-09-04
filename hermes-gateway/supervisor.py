@@ -140,8 +140,37 @@ def provision(cmd: dict) -> tuple:
         return False, f"profile create failed: {r.stderr.strip()[:300]}"
     with open(profile_env, "a") as f:
         f.write(f"\nRAKAZO_URL={API}\nRAKAZO_TOKEN={payload['token']}\nRAKAZO_HOME_CHANNEL={payload['threadId']}\n")
-    with open(soul, "w") as f:
-        f.write(payload.get("soul") or "You are a Rakazo bot.\n")
+    # 로컬 E2E 실측 3요소 (2026-09-05):
+    # 1) profile 게이트웨이는 HERMES_HOME(=프로파일 루트) plugins/만 탐색한다 — 전역
+    #    ~/.hermes/plugins가 아니므로 플러그인을 프로파일에 복사해야 한다.
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    plugin_dst_dir = os.path.expanduser(f"~/.hermes/profiles/{name}/plugins/rakazo")
+    try:
+        os.makedirs(plugin_dst_dir, exist_ok=True)
+        for fname in ("plugin.yaml", "adapter.py", "__init__.py"):
+            src = os.path.join(plugin_dir, fname)
+            if os.path.exists(src):
+                with open(src) as fin, open(os.path.join(plugin_dst_dir, fname), "w") as fout:
+                    fout.write(fin.read())
+    except OSError as exc:
+        return False, f"plugin copy failed: {exc}"
+    # 2) 플러그인 디스커버리는 plugins.enabled allow-list(옵트인) 게이트를 통과해야 한다.
+    # 3) hermes authz는 user_id 없는 인바운드를 정책과 무관하게 기각한다 — 어댑터가
+    #    threadId를 user_id로 싣고, 채널 인가는 api의 bearer 게이트가 이미 끝났으므로
+    #    프로파일에서 allow-all로 연다.
+    profile_cfg_path = os.path.expanduser(f"~/.hermes/profiles/{name}/config.yaml")
+    cfg = load_config(profile_cfg_path)
+    if cfg is None:
+        return False, f"config parse error: {profile_cfg_path}"
+    enabled = (cfg.get("plugins") or {}).get("enabled")
+    if not isinstance(enabled, list):
+        enabled = []
+    if "rakazo" not in enabled:
+        enabled.append("rakazo")
+        cfg.setdefault("plugins", {})["enabled"] = enabled
+        with open(profile_cfg_path, "w") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+    set_env_line(profile_env, "GATEWAY_ALLOW_ALL_USERS", "true")
     # Allocate the a2a port + roster BEFORE first gateway start so the a2a
     # server binds it from the very first run (profile-scoped a2a ignores
     # A2A_PORT env and reads platforms.a2a.port from config.yaml).
